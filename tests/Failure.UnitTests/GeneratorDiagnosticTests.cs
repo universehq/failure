@@ -1,0 +1,250 @@
+using System.Collections.Immutable;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+
+namespace Failure.UnitTests;
+
+public class GeneratorDiagnosticTests
+{
+    private static readonly CSharpParseOptions ParseOptions = new(LanguageVersion.Preview);
+    private static readonly ImmutableArray<MetadataReference> References =
+    [
+        .. ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator)
+            .Append(typeof(CompilerServices.FailureAttribute).Assembly.Location)
+            .Append(typeof(Polyester.Error.IError).Assembly.Location)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(static path => MetadataReference.CreateFromFile(path)),
+    ];
+    private static readonly string[] Expected = ["FAILURE004"];
+
+    [TestCase("[Failure(\"message\")] public class Error { }", "FAILURE001")]
+    [TestCase(
+        "public class Container { [Failure(\"message\")] public partial class Error { } }",
+        "FAILURE001"
+    )]
+    [TestCase("[Failure(\"message\")] file partial class Error { }", "FAILURE001")]
+    [TestCase("[FailureImpl] public partial class Error { }", "FAILURE002")]
+    [TestCase("[Failure(\"message\")] public static partial class Error { }", "FAILURE002")]
+    [TestCase("[Failure(\"message\")] public ref partial struct Error { }", "FAILURE002")]
+    [TestCase("[Failure(\"{Missing}\")] public partial record Error(string Name);", "FAILURE003")]
+    [TestCase("[Failure(\"{Name\")] public partial record Error(string Name);", "FAILURE003")]
+    [TestCase("[Failure(\"bad }\")] public partial record Error;", "FAILURE003")]
+    [TestCase("[Failure(null)] public partial record Error;", "FAILURE003")]
+    [TestCase(
+        "[Failure(\"{Name.ToString()}\")] public partial record Error(string Name);",
+        "FAILURE003"
+    )]
+    [TestCase("[Failure(\"{Name,Name}\")] public partial record Error(string Name);", "FAILURE003")]
+    [TestCase(
+        "[Failure(\"{Name}\")] public partial class Error { public static string Name => \"name\"; }",
+        "FAILURE003"
+    )]
+    [TestCase(
+        "[Failure(\"{Name}\")] public partial class Error { public string Name { set { } } }",
+        "FAILURE003"
+    )]
+    [TestCase(
+        "public class Base { public string Name { private get; set; } = \"\"; } [Failure(\"{Name}\")] public partial class Error : Base { }",
+        "FAILURE003"
+    )]
+    public void InvalidDeclarationsReportActionableDiagnostics(string source, string expectedId)
+    {
+        var compilation = CreateCompilation("using Failure.CompilerServices;\n" + source);
+        var result = CreateDriver().RunGenerators(compilation).GetRunResult();
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                result.Diagnostics.Select(static diagnostic => diagnostic.Id),
+                Is.EqualTo([expectedId])
+            );
+            Assert.That(result.GeneratedTrees, Is.Empty);
+            Assert.That(result.Results[0].Exception, Is.Null);
+        }
+    }
+
+    [Test]
+    public void MissingPolyesterReferenceReportsDiagnostic()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+            [FailureImpl] public readonly partial union Error(string);
+            """
+        );
+        compilation = compilation.RemoveReferences(
+            compilation.References.Where(reference =>
+                reference.Display == typeof(Polyester.Error.IError).Assembly.Location
+            )
+        );
+
+        var result = CreateDriver().RunGenerators(compilation).GetRunResult();
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                result.Diagnostics.Select(static diagnostic => diagnostic.Id),
+                Is.EqualTo(Expected)
+            );
+            Assert.That(result.GeneratedTrees, Is.Empty);
+        }
+    }
+
+    [Test]
+    public void NamespacesGenericAritiesAndPartialDeclarationsProduceDistinctValidSources()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+            [Failure("global")] public partial class Error { }
+            [Failure("{Data}")] public partial class Error<T> { public T Data = default!; }
+            namespace First
+            {
+                [Failure("{Name}")] public partial record Error;
+                public partial record Error { public string Name => "first"; }
+            }
+            namespace Second
+            {
+                [Failure("second")] public partial record Error;
+            }
+            namespace @event
+            {
+                [Failure("keyword")] public partial class @class { }
+            }
+            """
+        );
+
+        var driver = CreateDriver()
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(
+                output
+                    .GetDiagnostics()
+                    .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty
+            );
+            Assert.That(driver.GetRunResult().GeneratedTrees, Has.Length.EqualTo(5));
+            Assert.That(
+                driver
+                    .GetRunResult()
+                    .Results[0]
+                    .GeneratedSources.Select(static source => source.HintName)
+                    .Distinct()
+                    .Count(),
+                Is.EqualTo(5)
+            );
+        }
+    }
+
+    [Test]
+    public void ExplicitInterfaceSourceIsPreserved()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+            [FailureImpl]
+            public readonly partial union Error(string) : Polyester.Error.IError
+            {
+                Polyester.Error.IError? Polyester.Error.IError.Source => null;
+            }
+            """
+        );
+        CreateDriver()
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(
+                output
+                    .GetDiagnostics()
+                    .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty
+            );
+        }
+    }
+
+    [Test]
+    public void InheritedMembersAndGenericParameterAttributesCompile()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+            using System;
+            [AttributeUsage(AttributeTargets.GenericParameter)]
+            public class MarkerAttribute : Attribute { }
+            public class Base { protected string Name => "inherited"; }
+            [Failure("{Name}")]
+            public partial class Error<[Marker] T> : Base where T : class { }
+            """
+        );
+        CreateDriver()
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(
+                output
+                    .GetDiagnostics()
+                    .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty
+            );
+        }
+    }
+
+    [Test]
+    public void ReusingDriverUpdatesTemplatesAfterAnEdit()
+    {
+        var compilation = CreateCompilation(
+            """
+            [Failure.CompilerServices.Failure("before {Name}")]
+            public partial record Error(string Name);
+            """
+        );
+        var driver = CreateDriver().RunGenerators(compilation);
+        var originalTree = compilation.SyntaxTrees.Single();
+        var updatedTree = CSharpSyntaxTree.ParseText(
+            originalTree.ToString().Replace("before", "after"),
+            ParseOptions
+        );
+        compilation = compilation.ReplaceSyntaxTree(originalTree, updatedTree);
+        driver = driver.RunGeneratorsAndUpdateCompilation(
+            compilation,
+            out var output,
+            out var diagnostics
+        );
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(
+                output
+                    .GetDiagnostics()
+                    .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty
+            );
+            Assert.That(
+                driver.GetRunResult().GeneratedTrees.Single().ToString(),
+                Does.Contain("after {Name}").And.Not.Contain("before")
+            );
+        }
+    }
+
+    private static CSharpCompilation CreateCompilation(string source) =>
+        CSharpCompilation.Create(
+            "GeneratorTests",
+            new[] { CSharpSyntaxTree.ParseText(source, ParseOptions) },
+            References,
+            new CSharpCompilationOptions(
+                OutputKind.DynamicallyLinkedLibrary,
+                nullableContextOptions: NullableContextOptions.Enable
+            )
+        );
+
+    private static GeneratorDriver CreateDriver() =>
+        CSharpGeneratorDriver.Create(
+            [new SourceGenerator.FailureSourceGenerator().AsSourceGenerator()],
+            parseOptions: ParseOptions
+        );
+}

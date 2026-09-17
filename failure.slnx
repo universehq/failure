@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Failure.SourceGenerator/Failure.SourceGenerator.csproj" />
+    <Project Path="src/Failure/Failure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Failure.UnitTests/Failure.UnitTests.csproj" />
+  </Folder>
+</Solution>
