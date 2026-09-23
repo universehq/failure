@@ -24,7 +24,14 @@ public class GeneratorDiagnosticTests
         "FAILURE001"
     )]
     [TestCase("[Failure(\"message\")] file partial class Error { }", "FAILURE001")]
-    [TestCase("[FailureImpl] public partial class Error { }", "FAILURE002")]
+    [TestCase("[FailureImpl] public class Error { }", "FAILURE001")]
+    [TestCase("[FailureImpl] public static partial class Error { }", "FAILURE002")]
+    [TestCase("[FailureImpl] public ref partial struct Error { }", "FAILURE002")]
+    [TestCase("[FailureImpl(Transparent = true)] public partial class Error { }", "FAILURE005")]
+    [TestCase("[FailureImpl(Transparent = true)] public partial class Error { public Polyester.Error.IError Left => null!; public Polyester.Error.IError Right => null!; }", "FAILURE005")]
+    [TestCase("[FailureImpl(Transparent = true)][Failure(\"own message\")] public partial class Error { public Polyester.Error.IError Source => null!; }", "FAILURE002")]
+    [TestCase("[FailureImpl(Transparent = true)] public partial class Error { public Polyester.Error.IError Source => null!; public override string ToString() => \"own message\"; }", "FAILURE002")]
+    [TestCase("[FailureImpl(Transparent = true)] public readonly partial union Error(string);", "FAILURE006")]
     [TestCase("[Failure(\"message\")] public static partial class Error { }", "FAILURE002")]
     [TestCase("[Failure(\"message\")] public ref partial struct Error { }", "FAILURE002")]
     [TestCase("[Failure(\"{Missing}\")] public partial record Error(string Name);", "FAILURE003")]
@@ -160,6 +167,31 @@ public class GeneratorDiagnosticTests
                 output
                     .GetDiagnostics()
                     .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty
+            );
+        }
+    }
+
+    [Test]
+    public void TransparentUnionAcceptsACaseGeneratedAsAnErrorInTheSameCompilation()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+            [Failure("{Name}")]
+            [FailureImpl]
+            public partial record Cause(string Name);
+            [FailureImpl(Transparent = true)]
+            public readonly partial union Wrapper(Cause);
+            """
+        );
+        CreateDriver()
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(
+                output.GetDiagnostics().Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
                 Is.Empty
             );
         }

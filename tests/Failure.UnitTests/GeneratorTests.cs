@@ -93,7 +93,7 @@ public class GeneratorTests
         using (Assert.EnterMultipleScope())
         {
             Assert.That(leaf.ToString(), Is.EqualTo("custom leaf"));
-            Assert.That(leaf.Message, Is.EqualTo("generated message"));
+            Assert.That(leaf.Message, Is.EqualTo("Generated message"));
             Assert.That(union.Message, Is.EqualTo("custom message"));
             Assert.That(union.ToString(), Is.EqualTo("custom union"));
             Assert.That(union.Source, Is.Null);
@@ -125,7 +125,144 @@ public class GeneratorTests
             Assert.That(outer.Message, Is.EqualTo("external error"));
         }
     }
+
+    [Test]
+    public void FailureImplSupportsFormattedClassesAndStructs()
+    {
+        Polyester.Error.IError record = new FormattedError("settings.json");
+        Polyester.Error.IError value = new FormattedStructError("Worker");
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(record.ToString(), Is.EqualTo("Missing settings.json"));
+            Assert.That(record.Source, Is.Null);
+            Assert.That(value.ToString(), Is.EqualTo("App crashed: Worker"));
+            Assert.That(value.Source, Is.Null);
+        }
+    }
+
+    [Test]
+    public void FailureImplPreservesHandWrittenToStringAndSource()
+    {
+        Polyester.Error.IError cause = new PlainClassError("cause");
+        Polyester.Error.IError wrapper = new PlainClassError("wrapper", cause);
+        Polyester.Error.IError value = new PlainStructError(7);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(wrapper.ToString(), Is.EqualTo("wrapper"));
+            Assert.That(wrapper.Source, Is.SameAs(cause));
+            Assert.That(value.ToString(), Is.EqualTo("code 7"));
+            Assert.That(value.Source, Is.Null);
+        }
+    }
+
+    [Test]
+    public void FailureImplRequiresNoOtherMembersOnClassesAndStructs()
+    {
+        Polyester.Error.IError emptyClass = new EmptyClassError();
+        Polyester.Error.IError emptyStruct = new EmptyStructError();
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(emptyClass.ToString(), Does.Contain(nameof(EmptyClassError)));
+            Assert.That(emptyClass.Source, Is.Null);
+            Assert.That(emptyStruct.ToString(), Does.Contain(nameof(EmptyStructError)));
+            Assert.That(emptyStruct.Source, Is.Null);
+        }
+    }
+
+    [Test]
+    public void TransparentUnionForwardsItsInnerSource()
+    {
+        Polyester.Error.IError cause = new PlainClassError("cause");
+        ExternalError inner = new(cause);
+        Polyester.Error.IError wrapper = (TransparentFailure)inner;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(wrapper.ToString(), Is.EqualTo(inner.ToString()));
+            Assert.That(wrapper.Source, Is.SameAs(cause));
+        }
+    }
+
+    [Test]
+    public void NonTransparentStructAddsItsSourceToTheChain()
+    {
+        TestFailure inner = new NotFound { Filename = "settings.json", LimitSize = 32 };
+        AppError error = new() { AppName = "Worker", Source = inner };
+        Polyester.Error.IError asError = error;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(error.Message, Is.EqualTo("App crashed: Worker"));
+            Assert.That(error.ToString(), Is.EqualTo("App crashed: Worker"));
+            Assert.That(asError.ToString(), Is.EqualTo("App crashed: Worker"));
+            Assert.That(asError.Source, Is.TypeOf<TestFailure>());
+            Assert.That(asError.Source!.ToString(), Is.EqualTo(inner.ToString()));
+            Assert.That(error.Source, Is.EqualTo(inner));
+        }
+    }
+
+    [Test]
+    public void TransparentStructForwardsErrorGeneratedInTheSameCompilation()
+    {
+        TestFailure inner = new NotFound { Filename = "settings.json", LimitSize = 32 };
+        Polyester.Error.IError error = new TransparentStructError(inner);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(error.ToString(), Is.EqualTo(inner.ToString()));
+            Assert.That(error.Source, Is.Null);
+        }
+    }
+
+    [Test]
+    public void TransparentClassForwardsItsInnerError()
+    {
+        Polyester.Error.IError cause = new PlainClassError("cause");
+        Polyester.Error.IError inner = new PlainClassError("inner", cause);
+        Polyester.Error.IError wrapper = new TransparentClassError(inner);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(wrapper.ToString(), Is.EqualTo("inner"));
+            Assert.That(wrapper.Source, Is.SameAs(cause));
+        }
+    }
 }
+
+[CompilerServices.Failure("Missing {Path}")]
+[CompilerServices.FailureImpl]
+public partial record FormattedError(string Path);
+
+[CompilerServices.Failure("App crashed: {AppName}")]
+[CompilerServices.FailureImpl]
+public readonly partial record struct FormattedStructError(string AppName);
+
+[CompilerServices.FailureImpl(Transparent = true)]
+public partial class TransparentClassError(Polyester.Error.IError inner)
+{
+    public Polyester.Error.IError Inner => inner;
+}
+
+[CompilerServices.FailureImpl(Transparent = true)]
+public readonly partial record struct TransparentStructError(TestFailure Source);
+
+[CompilerServices.FailureImpl]
+public partial class PlainClassError(string text, Polyester.Error.IError? cause = null)
+{
+    public Polyester.Error.IError? Source => cause;
+    public override string ToString() => text;
+}
+
+[CompilerServices.FailureImpl]
+public readonly partial record struct PlainStructError(int Code)
+{
+    public override string ToString() => $"code {Code}";
+}
+
+[CompilerServices.FailureImpl]
+public partial class EmptyClassError;
+
+[CompilerServices.FailureImpl]
+public partial struct EmptyStructError;
+
+[CompilerServices.FailureImpl(Transparent = true)]
+public readonly partial union TransparentFailure(ExternalError);
 
 [CompilerServices.FailureImpl]
 public readonly partial union GeneratedInner(Disconnect);
@@ -139,7 +276,7 @@ public readonly partial record struct FormattedFailure(string Filename, int Size
 [CompilerServices.Failure("Missing {Filename}", OverrideString = false)]
 public partial record MessageOnly(string Filename);
 
-[CompilerServices.Failure("generated message")]
+[CompilerServices.Failure("Generated message")]
 public partial class CustomFailure
 {
     public override string ToString() => "custom leaf";
@@ -178,7 +315,7 @@ public readonly partial union ExternalFailure(ExternalError);
 public readonly partial union TestFailure(NotFound, IncompleteData, HyperError);
 
 [CompilerServices.FailureImpl]
-public readonly partial union HyperError(Disconnect) : Polyester.Error.IError;
+public readonly partial union HyperError(Disconnect);
 
 [CompilerServices.Failure("Can not find file {Filename} with size {LimitSize}")]
 public readonly partial record struct NotFound
@@ -197,4 +334,12 @@ public readonly partial record struct IncompleteData
 public readonly partial record struct Disconnect
 {
     public readonly required string Filename { get; init; }
+}
+
+[CompilerServices.FailureImpl]
+[CompilerServices.Failure("App crashed: {AppName}")]
+public readonly partial record struct AppError
+{
+    public readonly string AppName { get; init; }
+    public readonly TestFailure Source { get; init; }
 }

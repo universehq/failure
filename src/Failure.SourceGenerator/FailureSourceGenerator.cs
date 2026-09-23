@@ -50,6 +50,24 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         isEnabledByDefault: true
     );
 
+    private static readonly DiagnosticDescriptor InvalidTransparentMember = new(
+        "FAILURE005",
+        "Transparent failure needs one inner error",
+        "Type '{0}' needs exactly one readable IError field or property for Transparent, or a member named Source to disambiguate",
+        "Failure",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
+    private static readonly DiagnosticDescriptor InvalidTransparentCase = new(
+        "FAILURE006",
+        "Transparent union case must be an error",
+        "Union case '{0}' must implement Polyester.Error.IError to use Transparent",
+        "Failure",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var messages = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -90,10 +108,6 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             type.IsStatic
             || type.IsRefLikeType
             || declaration is UnionDeclarationSyntax
-            || type.GetAttributes()
-                .Any(static attribute =>
-                    attribute.AttributeClass?.ToDisplayString() == FailureImplAttributeName
-                )
         )
         {
             context.ReportDiagnostic(
@@ -102,7 +116,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
                     declaration.Identifier.GetLocation(),
                     "Failure",
                     type.Name,
-                    "use a non-static class, record, or struct without FailureImpl"
+                    "use a non-static class, record, or struct"
                 )
             );
             return;
@@ -132,6 +146,19 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             members.Append("public string Message => ").Append(expression).AppendLine(";");
         }
 
+        bool transparent = type.GetAttributes().Any(static candidateAttribute =>
+            candidateAttribute.AttributeClass?.ToDisplayString() == FailureImplAttributeName
+            && candidateAttribute.NamedArguments.Any(static argument =>
+                argument.Key == "Transparent" && argument.Value.Value is true
+            )
+        );
+
+        if (transparent)
+        {
+            // GenerateError reports the incompatible attribute combination.
+            return;
+        }
+
         if (overrideString && !HasToString(type))
         {
             members
@@ -155,7 +182,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             return;
         }
 
-        if (declaration is not UnionDeclarationSyntax)
+        if (type.IsStatic || type.IsRefLikeType)
         {
             context.ReportDiagnostic(
                 Diagnostic.Create(
@@ -163,7 +190,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
                     declaration.Identifier.GetLocation(),
                     "FailureImpl",
                     type.Name,
-                    "use a union declaration"
+                    "use a non-static, non-ref-like class or struct"
                 )
             );
             return;
@@ -185,50 +212,155 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             return;
         }
 
-        var members = new StringBuilder();
-        if (!HasUserMember(type, "Message"))
+        bool transparent = candidate.Attributes[0].NamedArguments.Any(static argument =>
+            argument.Key == "Transparent" && argument.Value.Value is true
+        );
+        if (transparent && type.GetAttributes().Any(static attribute =>
+            attribute.AttributeClass?.ToDisplayString() == FailureAttributeName
+        ))
         {
-            members.AppendLine("public string Message => Value?.ToString() ?? string.Empty;");
-        }
-
-        if (
-            !HasUserMember(type, "Source")
-            && !type.GetMembers()
-                .OfType<IPropertySymbol>()
-                .Any(property =>
-                    property.ExplicitInterfaceImplementations.Any(implementation =>
-                        implementation.Name == "Source"
-                        && SymbolEqualityComparer.Default.Equals(
-                            implementation.ContainingType,
-                            errorInterface
-                        )
-                    )
+            context.ReportDiagnostic(
+                Diagnostic.Create(
+                    InvalidTarget,
+                    declaration.Identifier.GetLocation(),
+                    "FailureImpl",
+                    type.Name,
+                    "Transparent cannot be combined with Failure because it forwards ToString()"
                 )
-        )
-        {
-            // This cast also recognizes IError implementations added to other unions in
-            // this generator run, which are not yet visible in the input compilation.
-            members.AppendLine(
-                "public global::Polyester.Error.IError? Source => Value as global::Polyester.Error.IError;"
             );
+            return;
         }
 
-        if (!HasToString(type))
+        var members = new StringBuilder();
+        if (declaration is UnionDeclarationSyntax)
         {
-            members.AppendLine("public override string ToString() => Message;");
+            if (!transparent && !HasUserMember(type, "Message"))
+            {
+                members.AppendLine("public string Message => Value?.ToString() ?? string.Empty;");
+            }
+
+            if (transparent)
+            {
+                var union = (UnionDeclarationSyntax)declaration;
+                if (union.ParameterList is null)
+                {
+                    // Leave malformed union syntax to the compiler's diagnostics.
+                    return;
+                }
+
+                foreach (var parameter in union.ParameterList.Parameters)
+                {
+                    var caseType = parameter.Type is null
+                        ? null
+                        : candidate.SemanticModel.GetTypeInfo(parameter.Type).Type;
+                    if (caseType is null || !IsErrorType(caseType, errorInterface))
+                    {
+                        context.ReportDiagnostic(
+                            Diagnostic.Create(
+                                InvalidTransparentCase,
+                                parameter.Type?.GetLocation() ?? parameter.GetLocation(),
+                                parameter.Type?.ToString() ?? "<missing>"
+                            )
+                        );
+                        return;
+                    }
+                }
+
+                if (HasToString(type)
+                    || HasExplicitErrorMember(type, errorInterface, "Source")
+                    || HasExplicitErrorMember(type, errorInterface, "ToString"))
+                {
+                    ReportTransparentConflict(context, declaration, type);
+                    return;
+                }
+
+                members.AppendLine("global::Polyester.Error.IError? global::Polyester.Error.IError.Source => (Value as global::Polyester.Error.IError)?.Source;");
+                members.AppendLine("public override string ToString() => (Value as global::Polyester.Error.IError)?.ToString() ?? string.Empty;");
+            }
+            else
+            {
+                if (!HasUserMember(type, "Source") && !HasExplicitErrorMember(type, errorInterface, "Source"))
+                {
+                    // The runtime cast recognizes IError implementations generated
+                    // for other union cases in this compilation.
+                    members.AppendLine("public global::Polyester.Error.IError? Source => Value as global::Polyester.Error.IError;");
+                }
+
+                if (!HasToString(type))
+                {
+                    members.AppendLine("public override string ToString() => Message;");
+                }
+            }
+        }
+        else
+        {
+            if (transparent)
+            {
+                var inner = FindTransparentMember(type, errorInterface);
+                if (inner is null)
+                {
+                    context.ReportDiagnostic(
+                        Diagnostic.Create(
+                            InvalidTransparentMember,
+                            declaration.Identifier.GetLocation(),
+                            type.Name
+                        )
+                    );
+                    return;
+                }
+
+                if (HasToString(type) || HasExplicitErrorMember(type, errorInterface, "Source")
+                    || HasExplicitErrorMember(type, errorInterface, "ToString"))
+                {
+                    ReportTransparentConflict(context, declaration, type);
+                    return;
+                }
+
+                string innerValue = "((object?)this.@" + inner.Name + " as global::Polyester.Error.IError)";
+                members.Append("global::Polyester.Error.IError? global::Polyester.Error.IError.Source => ")
+                    .Append(innerValue)
+                    .AppendLine("?.Source;");
+                members.Append("public override string ToString() => ")
+                    .Append(innerValue)
+                    .AppendLine("?.ToString() ?? string.Empty;");
+            }
+            else
+            {
+                // A Source field or property is the immediate cause, including
+                // a struct case that gains IError in this generator run.
+                var sourceMember = FindSourceMember(type, errorInterface);
+                if (sourceMember is not null && !HasExplicitErrorMember(type, errorInterface, "Source"))
+                {
+                    members.Append("global::Polyester.Error.IError? global::Polyester.Error.IError.Source => (object?)this.@")
+                        .Append(sourceMember.Name)
+                        .AppendLine(" as global::Polyester.Error.IError;");
+                }
+
+                if (!HasToString(type) && !HasExplicitErrorMember(type, errorInterface, "ToString"))
+                {
+                    // object.ToString() and ValueType.ToString() are nullable in
+                    // their annotations. IError.ToString() promises non-null.
+                    members.AppendLine(
+                        "string global::Polyester.Error.IError.ToString() => ToString() ?? string.Empty;"
+                    );
+                }
+            }
         }
 
         bool implementsError = type.AllInterfaces.Any(@interface =>
             SymbolEqualityComparer.Default.Equals(@interface, errorInterface)
         );
-        AddSource(
-            context,
-            type,
-            declaration,
-            "Error",
-            members.ToString(),
-            implementsError ? null : "global::" + ErrorTypeName
-        );
+        if (members.Length > 0 || !implementsError)
+        {
+            AddSource(
+                context,
+                type,
+                declaration,
+                "Error",
+                members.ToString(),
+                implementsError ? null : "global::" + ErrorTypeName
+            );
+        }
     }
 
     private static bool ValidatePartialType(
@@ -382,6 +514,84 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             .Any(static method =>
                 !method.IsImplicitlyDeclared && method.Parameters.Length == 0 && method.Arity == 0
             );
+
+    private static bool HasExplicitErrorMember(
+        INamedTypeSymbol type,
+        INamedTypeSymbol errorInterface,
+        string name
+    ) => type.GetMembers().Any(member =>
+        (member as IPropertySymbol)?.ExplicitInterfaceImplementations.Any(implementation =>
+            implementation.Name == name
+            && SymbolEqualityComparer.Default.Equals(implementation.ContainingType, errorInterface)
+        ) == true
+        || (member as IMethodSymbol)?.ExplicitInterfaceImplementations.Any(implementation =>
+            implementation.Name == name
+            && SymbolEqualityComparer.Default.Equals(implementation.ContainingType, errorInterface)
+        ) == true
+    );
+
+    private static void ReportTransparentConflict(
+        SourceProductionContext context,
+        TypeDeclarationSyntax declaration,
+        INamedTypeSymbol type
+    ) => context.ReportDiagnostic(
+        Diagnostic.Create(
+            InvalidTarget,
+            declaration.Identifier.GetLocation(),
+            "FailureImpl",
+            type.Name,
+            "Transparent must forward ToString() and IError.Source; remove custom implementations"
+        )
+    );
+
+    private static ISymbol? FindSourceMember(
+        INamedTypeSymbol type,
+        INamedTypeSymbol errorInterface
+    ) => type.GetMembers("Source").FirstOrDefault(member =>
+        IsReadableErrorMember(member, errorInterface)
+    );
+
+    private static ISymbol? FindTransparentMember(
+        INamedTypeSymbol type,
+        INamedTypeSymbol errorInterface
+    )
+    {
+        var candidates = type.GetMembers()
+            .Where(member => IsReadableErrorMember(member, errorInterface))
+            .ToArray();
+
+        return candidates.Length == 1
+            ? candidates[0]
+            : candidates.SingleOrDefault(static member => member.Name == "Source");
+    }
+
+    private static bool IsReadableErrorMember(ISymbol member, INamedTypeSymbol errorInterface) =>
+        !member.IsStatic
+        && !(member is IFieldSymbol && member.IsImplicitlyDeclared)
+        && (member is IFieldSymbol || member is IPropertySymbol { IsIndexer: false, GetMethod: not null })
+        && GetMemberType(member) is { } memberType
+        && IsErrorType(memberType, errorInterface);
+
+    private static bool IsErrorType(ITypeSymbol type, INamedTypeSymbol errorInterface) =>
+        SymbolEqualityComparer.Default.Equals(type, errorInterface)
+        || type is INamedTypeSymbol namedType
+            && (namedType.AllInterfaces.Any(@interface =>
+                    SymbolEqualityComparer.Default.Equals(@interface, errorInterface)
+                )
+                || namedType.GetAttributes().Any(static attribute =>
+                    attribute.AttributeClass?.ToDisplayString() == FailureImplAttributeName
+                )
+                || namedType.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
+                    && IsErrorType(namedType.TypeArguments[0], errorInterface))
+        || type is ITypeParameterSymbol parameter
+            && parameter.ConstraintTypes.Any(constraint => IsErrorType(constraint, errorInterface));
+
+    private static ITypeSymbol? GetMemberType(ISymbol member) => member switch
+    {
+        IFieldSymbol field => field.Type,
+        IPropertySymbol property => property.Type,
+        _ => null,
+    };
 
     private static void AddSource(
         SourceProductionContext context,
