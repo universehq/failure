@@ -164,6 +164,57 @@ public class GeneratorDiagnosticTests
     }
 
     [Test]
+    public void ReadmeExampleCompiles()
+    {
+        var compilation = CreateCompilation(
+            """
+            using Failure.CompilerServices;
+
+            [Failure("Can not find file {Filename} with size {LimitSize}")]
+            public readonly record struct NotFound(string Filename, int LimitSize);
+
+            [Failure("Disconnected from {Host}")]
+            public readonly record struct Disconnect(string Host);
+
+            [FailureImpl]
+            public readonly partial union HyperError(Disconnect);
+
+            [FailureImpl]
+            public readonly partial union FileFailure(NotFound, HyperError);
+
+            [Failure("Could not read {Filename}")]
+            [FailureImpl]
+            public partial record ReadFailure(string Filename);
+
+            [Failure("App crashed: {AppName}")]
+            [FailureImpl]
+            public readonly partial record struct AppError(string AppName, FileFailure Source);
+
+            [Failure("Could not run {Operation}")]
+            [FailureImpl]
+            public readonly partial record struct OperationError(string Operation, FileFailure Cause)
+            {
+                Polyester.Error.IError? Polyester.Error.IError.Source => Cause;
+            }
+
+            [FailureImpl(Transparent = true)]
+            public readonly partial record struct ErrorAlias(FileFailure Source);
+            """
+        );
+        var driver = CreateDriver()
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(diagnostics, Is.Empty);
+            Assert.That(output.GetDiagnostics()
+                .Where(static diagnostic => diagnostic.Severity >= DiagnosticSeverity.Warning),
+                Is.Empty);
+            Assert.That(driver.GetRunResult().GeneratedTrees, Has.Length.EqualTo(6));
+        }
+    }
+
+    [Test]
     public void NamespacesGenericAritiesAndPartialDeclarationsProduceDistinctValidSources()
     {
         var compilation = CreateCompilation(
@@ -333,7 +384,7 @@ public class GeneratorDiagnosticTests
     private static CSharpCompilation CreateCompilation(string source) =>
         CSharpCompilation.Create(
             "GeneratorTests",
-            new[] { CSharpSyntaxTree.ParseText(source, ParseOptions) },
+            [CSharpSyntaxTree.ParseText(source, ParseOptions)],
             References,
             new CSharpCompilationOptions(
                 OutputKind.DynamicallyLinkedLibrary,

@@ -37,25 +37,27 @@ public readonly partial record struct OperationError(
     Polyester.Error.IError? Polyester.Error.IError.Source => Cause;
 }
 
-[Failure(Transparent = true)]
-[FailureImpl]
+[FailureImpl(Transparent = true)]
 public readonly partial record struct ErrorAlias(FileFailure Source);
 ```
 
-Only `[FailureImpl]` triggers source generation. `[Failure]` supplies either a
-message template or transparent forwarding mode. With a template on a class or
-struct with `[FailureImpl]`, it generates `Message` and
-normally overrides `ToString()`. On a union case, the union's `[FailureImpl]`
-uses the template to format that case; the case itself receives no generated
-members and does not need to be partial. Placeholders name readable instance
-fields or properties, including record constructor properties. For union cases,
-those members must also be accessible from the union. Alignment and format
-specifiers work as in C# interpolation (`{LimitSize,8:D4}`); use `{{` and `}}`
-for literal braces. Formatting uses the current culture. On a class or struct
-with `[FailureImpl]`, set `OverrideString = false` to generate only `Message`,
-preserving its normal `ToString()` behavior. A union still uses the case's
-template regardless of that flag or the case's own `ToString()`. Existing
-explicit members are preserved.
+Only `[FailureImpl]` triggers source generation. `[Failure("...")]` supplies a
+message template and is independently validated: a bad placeholder reports
+`FAILURE003` even when no `[FailureImpl]` uses it. It does not generate members
+on its own. For example, `NotFound` is a plain record struct, not an `IError`;
+`FileFailure` formats it using its `[Failure]` template.
+
+On a class or struct with both attributes, the generator adds `Message` and
+normally overrides `ToString()`. Set `OverrideString = false` to generate only
+`Message`. On a union case, the union uses the case's template regardless of
+that flag or the case's own `ToString()`; the case itself receives no generated
+members and need not be partial. Existing user-defined members are preserved.
+
+Placeholders name readable instance fields or properties, including record
+constructor properties. For union cases, those members must also be accessible
+from the union. Alignment and format specifiers work as in C# interpolation
+(`{LimitSize,8:D4}`); use `{{` and `}}` for literal braces. Formatting uses the
+current culture.
 
 `[FailureImpl]` adds `IError` to any partial class or struct, including records
 and unions, unless it already implements it. `IError` requires `ToString()` and
@@ -67,31 +69,29 @@ differently named cause, implement `IError.Source` explicitly as in
 `OperationError` above. The type's own `ToString()` provides its message. A
 member named `Source` must be a readable instance `IError` member.
 
-For unions, `[FailureImpl]` also generates:
+For nontransparent unions, `[FailureImpl]` generates:
 
 - `Message`: the case's `[Failure]` template when present, otherwise the
   contained value's `ToString()`; an empty string for null.
 - `Source`: the contained value if it implements `IError`, otherwise null.
 - `ToString()`: the union's `Message`, so nested unions format consistently.
 
-Use `[Failure(Transparent = true)]` with `[FailureImpl]` for a wrapper that adds
-no message of its own. A transparent failure cannot specify a template. It
-forwards `ToString()` and `IError.Source` through the contained error, so it does
-not add a link to the cause chain. On classes and structs, the generator chooses
-a readable `IError` member named `Source`, or the only readable `IError` member.
-It reports `FAILURE005` if the inner error is missing or ambiguous. Every case
-of a transparent union must implement
-`IError`; otherwise the generator reports `FAILURE006`.
-If a case itself uses `[Failure(Transparent = true)]`, it also needs its own
-`[FailureImpl]`.
+Use `[FailureImpl(Transparent = true)]` for a wrapper that adds no message of
+its own. Do not combine it with `[Failure]`. Transparent wrappers forward
+`ToString()` and `IError.Source` through the inner error, so they do not add a
+link to the cause chain. A transparent union does not generate `Message`, and
+every case must implement `IError` (`FAILURE006` otherwise). On classes and
+structs, the generator chooses a readable `IError` member named `Source`, or
+the only readable `IError` member. Missing or ambiguous inner errors report
+`FAILURE005`.
 
-`[Failure]` alone generates no source code, but its template is still validated;
-an invalid placeholder reports `FAILURE003` even without `[FailureImpl]`. In
-this example a `NotFound` case has no
-source, while a `HyperError` case exposes that error as its immediate source.
+In this example a `NotFound` case has no source, while a `HyperError` case
+exposes that error as its immediate source.
 An inner union can receive its `IError` implementation in the same generator run.
-Default unions produce an empty message and a null source. Custom `Message`,
-`Source`, and `ToString()` members take precedence over generation.
+Default nontransparent unions produce an empty message and a null source.
+Custom `Message`, `Source`, and `ToString()` members take precedence for
+nontransparent unions; transparent wrappers must let the generator forward
+`ToString()` and `IError.Source`.
 
 Types with `[FailureImpl]` and their containing types must be partial. Nested types,
 generics, and escaped identifiers are supported. The generator reports
