@@ -68,9 +68,18 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         isEnabledByDefault: true
     );
 
+    private static readonly DiagnosticDescriptor InvalidSourceMember = new(
+        "FAILURE007",
+        "Failure source must be an error",
+        "Member '{0}' on '{1}' must be a readable instance IError field or property",
+        "Failure",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        var messages = context.SyntaxProvider.ForAttributeWithMetadataName(
+        var formats = context.SyntaxProvider.ForAttributeWithMetadataName(
             FailureAttributeName,
             static (node, _) => node is TypeDeclarationSyntax,
             static (attributeContext, _) => attributeContext
@@ -83,8 +92,8 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         );
 
         context.RegisterSourceOutput(
-            messages,
-            static (output, candidate) => GenerateMessage(output, candidate)
+            formats,
+            static (output, candidate) => ValidateFailureFormat(output, candidate)
         );
         context.RegisterSourceOutput(
             errors,
@@ -92,82 +101,22 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         );
     }
 
-    private static void GenerateMessage(
+    private static void ValidateFailureFormat(
         SourceProductionContext context,
         GeneratorAttributeSyntaxContext candidate
     )
     {
         var type = (INamedTypeSymbol)candidate.TargetSymbol;
         var declaration = (TypeDeclarationSyntax)candidate.TargetNode;
-        if (!ValidatePartialType(context, type, declaration))
-        {
-            return;
-        }
-
-        if (
-            type.IsStatic
-            || type.IsRefLikeType
-            || declaration is UnionDeclarationSyntax
-        )
-        {
-            context.ReportDiagnostic(
-                Diagnostic.Create(
-                    InvalidTarget,
-                    declaration.Identifier.GetLocation(),
-                    "Failure",
-                    type.Name,
-                    "use a non-static class, record, or struct"
-                )
-            );
-            return;
-        }
-
-        var attribute = candidate.Attributes[0];
-        string? format = attribute.ConstructorArguments.FirstOrDefault().Value as string;
-        var expression = CreateMessageExpression(
+        string? format = candidate.Attributes[0].ConstructorArguments.FirstOrDefault().Value as string;
+        CreateMessageExpression(
             context,
             type,
-            declaration,
+            type,
+            declaration.Identifier.GetLocation(),
             format,
             candidate.SemanticModel.Compilation
         );
-        if (expression is null)
-        {
-            return;
-        }
-
-        bool overrideString = !attribute.NamedArguments.Any(static argument =>
-            argument.Key == "OverrideString" && argument.Value.Value is false
-        );
-
-        var members = new StringBuilder();
-        if (!HasUserMember(type, "Message"))
-        {
-            members.Append("public string Message => ").Append(expression).AppendLine(";");
-        }
-
-        bool transparent = type.GetAttributes().Any(static candidateAttribute =>
-            candidateAttribute.AttributeClass?.ToDisplayString() == FailureImplAttributeName
-            && candidateAttribute.NamedArguments.Any(static argument =>
-                argument.Key == "Transparent" && argument.Value.Value is true
-            )
-        );
-
-        if (transparent)
-        {
-            // GenerateError reports the incompatible attribute combination.
-            return;
-        }
-
-        if (overrideString && !HasToString(type))
-        {
-            members
-                .Append("public override string ToString() => ")
-                .Append(expression)
-                .AppendLine(";");
-        }
-
-        AddSource(context, type, declaration, "Message", members.ToString());
     }
 
     private static void GenerateError(
@@ -212,22 +161,33 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             return;
         }
 
+        var failureAttribute = type.GetAttributes().FirstOrDefault(static attribute =>
+            attribute.AttributeClass?.ToDisplayString() == FailureAttributeName
+        );
         bool transparent = candidate.Attributes[0].NamedArguments.Any(static argument =>
             argument.Key == "Transparent" && argument.Value.Value is true
         );
-        if (transparent && type.GetAttributes().Any(static attribute =>
-            attribute.AttributeClass?.ToDisplayString() == FailureAttributeName
-        ))
+        if (transparent && failureAttribute is not null)
         {
-            context.ReportDiagnostic(
-                Diagnostic.Create(
-                    InvalidTarget,
-                    declaration.Identifier.GetLocation(),
-                    "FailureImpl",
-                    type.Name,
-                    "Transparent cannot be combined with Failure because it forwards ToString()"
-                )
-            );
+            context.ReportDiagnostic(Diagnostic.Create(
+                InvalidTarget,
+                declaration.Identifier.GetLocation(),
+                "FailureImpl",
+                type.Name,
+                "Transparent cannot be combined with Failure because it forwards ToString()"
+            ));
+            return;
+        }
+
+        if (failureAttribute is not null && declaration is UnionDeclarationSyntax)
+        {
+            context.ReportDiagnostic(Diagnostic.Create(
+                InvalidTarget,
+                declaration.Identifier.GetLocation(),
+                "Failure",
+                type.Name,
+                "put Failure on union case types, not on the union"
+            ));
             return;
         }
 
@@ -236,7 +196,17 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         {
             if (!transparent && !HasUserMember(type, "Message"))
             {
-                members.AppendLine("public string Message => Value?.ToString() ?? string.Empty;");
+                string? messageExpression = CreateUnionMessageExpression(
+                    context, type, (UnionDeclarationSyntax)declaration, candidate.SemanticModel
+                );
+                if (messageExpression is null)
+                {
+                    return;
+                }
+
+                members.Append("public string Message => ")
+                    .Append(messageExpression)
+                    .AppendLine(";");
             }
 
             if (transparent)
@@ -294,9 +264,46 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         }
         else
         {
+            if (failureAttribute is not null)
+            {
+                string? format = failureAttribute.ConstructorArguments.FirstOrDefault().Value as string;
+                string? expression = CreateMessageExpression(
+                    context,
+                    type,
+                    type,
+                    declaration.Identifier.GetLocation(),
+                    format,
+                    candidate.SemanticModel.Compilation,
+                    reportDiagnostic: false
+                );
+                if (expression is null)
+                {
+                    return;
+                }
+
+                if (!HasUserMember(type, "Message"))
+                {
+                    members.Append("public string Message => ").Append(expression).AppendLine(";");
+                }
+
+                if (ShouldOverrideString(failureAttribute) && !HasToString(type))
+                {
+                    members.Append("public override string ToString() => ")
+                        .Append(expression)
+                        .AppendLine(";");
+                }
+            }
+
+            bool hasExplicitSource = HasExplicitErrorMember(type, errorInterface, "Source");
+            if (!TryFindSourceMember(context, type, declaration, errorInterface, transparent,
+                    hasExplicitSource, out var sourceMember))
+            {
+                return;
+            }
+
             if (transparent)
             {
-                var inner = FindTransparentMember(type, errorInterface);
+                var inner = sourceMember;
                 if (inner is null)
                 {
                     context.ReportDiagnostic(
@@ -309,7 +316,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
                     return;
                 }
 
-                if (HasToString(type) || HasExplicitErrorMember(type, errorInterface, "Source")
+                if (HasToString(type) || hasExplicitSource
                     || HasExplicitErrorMember(type, errorInterface, "ToString"))
                 {
                     ReportTransparentConflict(context, declaration, type);
@@ -328,8 +335,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             {
                 // A Source field or property is the immediate cause, including
                 // a struct case that gains IError in this generator run.
-                var sourceMember = FindSourceMember(type, errorInterface);
-                if (sourceMember is not null && !HasExplicitErrorMember(type, errorInterface, "Source"))
+                if (sourceMember is not null && !hasExplicitSource)
                 {
                     members.Append("global::Polyester.Error.IError? global::Polyester.Error.IError.Source => (object?)this.@")
                         .Append(sourceMember.Name)
@@ -400,12 +406,96 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         return true;
     }
 
+    private static bool ShouldOverrideString(AttributeData attribute) =>
+        !attribute.NamedArguments.Any(static argument =>
+            argument.Key == "OverrideString" && argument.Value.Value is false
+        );
+
+    private static string? CreateUnionMessageExpression(
+        SourceProductionContext context,
+        INamedTypeSymbol unionType,
+        UnionDeclarationSyntax union,
+        SemanticModel semanticModel
+    )
+    {
+        if (union.ParameterList is null)
+        {
+            // Leave malformed union syntax to the compiler's diagnostics.
+            return "Value?.ToString() ?? string.Empty";
+        }
+
+        var cases = new StringBuilder();
+        foreach (var parameter in union.ParameterList.Parameters)
+        {
+            if (parameter.Type is null
+                || semanticModel.GetTypeInfo(parameter.Type).Type is not INamedTypeSymbol caseType)
+            {
+                continue;
+            }
+
+            var attribute = caseType.GetAttributes().FirstOrDefault(static candidate =>
+                candidate.AttributeClass?.ToDisplayString() == FailureAttributeName
+            );
+            if (attribute is null)
+            {
+                continue;
+            }
+
+            string? format = attribute.ConstructorArguments.FirstOrDefault().Value as string;
+            // The diagnostic-only Failure path owns template errors. A union
+            // reports only the additional error of an inaccessible case member.
+            if (CreateMessageExpression(
+                    context,
+                    caseType,
+                    caseType,
+                    parameter.Type.GetLocation(),
+                    format,
+                    semanticModel.Compilation,
+                    reportDiagnostic: false
+                ) is null)
+            {
+                return null;
+            }
+
+            string? expression = CreateMessageExpression(
+                context,
+                caseType,
+                unionType,
+                parameter.Type.GetLocation(),
+                format,
+                semanticModel.Compilation,
+                "@error"
+            );
+            if (expression is null)
+            {
+                return null;
+            }
+
+            cases.Append(caseType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                .Append(" @error => ")
+                .Append(expression)
+                .AppendLine(",");
+        }
+
+        if (cases.Length == 0)
+        {
+            return "Value?.ToString() ?? string.Empty";
+        }
+
+        return "Value switch\n{\n"
+            + cases
+            + "_ => Value?.ToString() ?? string.Empty,\n}";
+    }
+
     private static string? CreateMessageExpression(
         SourceProductionContext context,
         INamedTypeSymbol type,
-        TypeDeclarationSyntax declaration,
+        INamedTypeSymbol accessWithin,
+        Location location,
         string? format,
-        Compilation compilation
+        Compilation compilation,
+        string? receiver = null,
+        bool reportDiagnostic = true
     )
     {
         string? error = null;
@@ -429,10 +519,8 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
             {
                 foreach (var interpolation in expression.Contents.OfType<InterpolationSyntax>())
                 {
-                    if (
-                        interpolation.Expression is not IdentifierNameSyntax identifier
-                        || !HasReadableMember(type, identifier.Identifier.ValueText, compilation)
-                    )
+                    if (interpolation.Expression is not IdentifierNameSyntax identifier
+                        || !HasReadableMember(type, accessWithin, identifier.Identifier.ValueText, compilation))
                     {
                         error =
                             $"'{interpolation.Expression}' must name a readable instance field or property";
@@ -463,15 +551,31 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
 
         if (error is not null)
         {
-            context.ReportDiagnostic(
-                Diagnostic.Create(
-                    InvalidFormat,
-                    declaration.Identifier.GetLocation(),
-                    type.Name,
-                    error
+            if (reportDiagnostic)
+            {
+                context.ReportDiagnostic(
+                    Diagnostic.Create(
+                        InvalidFormat,
+                        location,
+                        type.Name,
+                        error
+                    )
+                );
+            }
+            return null;
+        }
+
+        if (receiver is not null)
+        {
+            var parsedExpression = expression!;
+            expression = parsedExpression.ReplaceNodes(
+                parsedExpression.Contents.OfType<InterpolationSyntax>(),
+                (original, _) => original.WithExpression(
+                    SyntaxFactory.ParseExpression(
+                        receiver + "." + ((IdentifierNameSyntax)original.Expression).Identifier.Text
+                    )
                 )
             );
-            return null;
         }
 
         return expression!.ToFullString();
@@ -479,6 +583,7 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
 
     private static bool HasReadableMember(
         INamedTypeSymbol type,
+        INamedTypeSymbol accessWithin,
         string name,
         Compilation compilation
     )
@@ -493,11 +598,11 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
 
             return members.Any(member =>
                 !member.IsStatic
-                && compilation.IsSymbolAccessibleWithin(member, type)
+                && compilation.IsSymbolAccessibleWithin(member, accessWithin)
                 && (
                     member is IFieldSymbol
                     || member is IPropertySymbol { IsIndexer: false, GetMethod: not null } property
-                        && compilation.IsSymbolAccessibleWithin(property.GetMethod, type)
+                        && compilation.IsSymbolAccessibleWithin(property.GetMethod, accessWithin)
                 )
             );
         }
@@ -544,25 +649,49 @@ public sealed class FailureSourceGenerator : IIncrementalGenerator
         )
     );
 
-    private static ISymbol? FindSourceMember(
+    private static bool TryFindSourceMember(
+        SourceProductionContext context,
         INamedTypeSymbol type,
-        INamedTypeSymbol errorInterface
-    ) => type.GetMembers("Source").FirstOrDefault(member =>
-        IsReadableErrorMember(member, errorInterface)
-    );
-
-    private static ISymbol? FindTransparentMember(
-        INamedTypeSymbol type,
-        INamedTypeSymbol errorInterface
+        TypeDeclarationSyntax declaration,
+        INamedTypeSymbol errorInterface,
+        bool transparent,
+        bool hasExplicitSource,
+        out ISymbol? sourceMember
     )
     {
-        var candidates = type.GetMembers()
-            .Where(member => IsReadableErrorMember(member, errorInterface))
-            .ToArray();
+        sourceMember = null;
+        ISymbol? selected = transparent || !hasExplicitSource
+            ? type.GetMembers("Source").FirstOrDefault(member =>
+                member is IFieldSymbol or IPropertySymbol
+            )
+            : null;
 
-        return candidates.Length == 1
-            ? candidates[0]
-            : candidates.SingleOrDefault(static member => member.Name == "Source");
+        if (selected is not null)
+        {
+            if (!IsReadableErrorMember(selected, errorInterface))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    InvalidSourceMember,
+                    selected.Locations.FirstOrDefault() ?? declaration.Identifier.GetLocation(),
+                    selected.Name,
+                    type.Name
+                ));
+                return false;
+            }
+
+            sourceMember = selected;
+            return true;
+        }
+
+        if (transparent)
+        {
+            var candidates = type.GetMembers()
+                .Where(member => IsReadableErrorMember(member, errorInterface))
+                .ToArray();
+            sourceMember = candidates.Length == 1 ? candidates[0] : null;
+        }
+
+        return true;
     }
 
     private static bool IsReadableErrorMember(ISymbol member, INamedTypeSymbol errorInterface) =>

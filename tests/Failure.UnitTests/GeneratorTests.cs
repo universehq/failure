@@ -6,11 +6,12 @@ public class GeneratorTests
     public void TestErrorFormat()
     {
         NotFound notFound = new() { Filename = "Program.cs", LimitSize = 20 };
+        TestFailure error = notFound;
 
         using (Assert.EnterMultipleScope())
         {
-            Assert.That(notFound.ToString(), Is.EqualTo("Can not find file Program.cs with size 20"));
-            Assert.That(notFound.Message, Is.EqualTo(notFound.ToString()));
+            Assert.That(error.ToString(), Is.EqualTo("Can not find file Program.cs with size 20"));
+            Assert.That(error.Message, Is.EqualTo(error.ToString()));
         }
     }
 
@@ -75,6 +76,25 @@ public class GeneratorTests
     }
 
     [Test]
+    public void UnionFormatsMetadataOnlyCases()
+    {
+        FormattedUnion error = new FormattedCase("go", 7);
+        Assert.That(error.Message, Is.EqualTo("Code go:  007"));
+    }
+
+    [Test]
+    public void UnionTemplateDoesNotChangeCaseToString()
+    {
+        CustomDisplayCase leaf = new("file.txt");
+        CustomDisplayUnion error = leaf;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(leaf.ToString(), Is.EqualTo("manual display"));
+            Assert.That(error.Message, Is.EqualTo("Missing file.txt"));
+        }
+    }
+
+    [Test]
     public void OverrideStringCanBeDisabled()
     {
         MessageOnly error = new("input.cs");
@@ -93,7 +113,6 @@ public class GeneratorTests
         using (Assert.EnterMultipleScope())
         {
             Assert.That(leaf.ToString(), Is.EqualTo("custom leaf"));
-            Assert.That(leaf.Message, Is.EqualTo("Generated message"));
             Assert.That(union.Message, Is.EqualTo("custom message"));
             Assert.That(union.ToString(), Is.EqualTo("custom union"));
             Assert.That(union.Source, Is.Null);
@@ -223,6 +242,47 @@ public class GeneratorTests
             Assert.That(wrapper.Source, Is.SameAs(cause));
         }
     }
+
+    [Test]
+    public void ExplicitSourceGetterAddsAnImmediateSourceLink()
+    {
+        Polyester.Error.IError cause = new PlainClassError("network");
+        Polyester.Error.IError wrapper = new ExplicitCauseError(cause);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(wrapper.ToString(), Is.EqualTo("request failed"));
+            Assert.That(wrapper.Source, Is.SameAs(cause));
+        }
+    }
+
+    [Test]
+    public void SourceGetterDisambiguatesTransparentWrapper()
+    {
+        Polyester.Error.IError cause = new PlainClassError("root");
+        Polyester.Error.IError inner = new PlainClassError("inner", cause);
+        Polyester.Error.IError wrapper = new GetterTransparentError(inner, new PlainClassError("other"));
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(wrapper.ToString(), Is.EqualTo("inner"));
+            Assert.That(wrapper.Source, Is.SameAs(cause));
+        }
+    }
+}
+
+[CompilerServices.FailureImpl]
+public partial record ExplicitCauseError(Polyester.Error.IError Cause)
+{
+    Polyester.Error.IError? Polyester.Error.IError.Source => Cause;
+    public override string ToString() => "request failed";
+}
+
+[CompilerServices.FailureImpl(Transparent = true)]
+public partial record GetterTransparentError(
+    Polyester.Error.IError Inner,
+    Polyester.Error.IError Other
+)
+{
+    public Polyester.Error.IError Source => Inner;
 }
 
 [CompilerServices.Failure("Missing {Path}")]
@@ -271,9 +331,26 @@ public readonly partial union GeneratedInner(Disconnect);
 public readonly partial union GeneratedOuter(GeneratedInner);
 
 [CompilerServices.Failure("\"{Filename}\" at C:\\temp\n{{size={Size,5:D4}}}")]
+[CompilerServices.FailureImpl]
 public readonly partial record struct FormattedFailure(string Filename, int Size);
 
+[CompilerServices.Failure("Code {@Event}: {Size,4:D3}")]
+public readonly record struct FormattedCase(string @Event, int Size);
+
+[CompilerServices.FailureImpl]
+public readonly partial union FormattedUnion(FormattedCase);
+
+[CompilerServices.Failure("Missing {Name}", OverrideString = false)]
+public record CustomDisplayCase(string Name)
+{
+    public override string ToString() => "manual display";
+}
+
+[CompilerServices.FailureImpl]
+public readonly partial union CustomDisplayUnion(CustomDisplayCase);
+
 [CompilerServices.Failure("Missing {Filename}", OverrideString = false)]
+[CompilerServices.FailureImpl]
 public partial record MessageOnly(string Filename);
 
 [CompilerServices.Failure("Generated message")]
@@ -293,13 +370,14 @@ public readonly partial union CustomError(CustomFailure)
 public partial class Container<T> where T : class
 {
     [CompilerServices.Failure("{Name}: {Data}")]
-    public readonly partial record struct NestedFailure<TData>(T Name, TData Data) where TData : struct;
+    public readonly record struct NestedFailure<TData>(T Name, TData Data) where TData : struct;
 
     [CompilerServices.FailureImpl]
     public readonly partial union NestedError<TData>(NestedFailure<TData>) where TData : struct;
 }
 
 [CompilerServices.Failure("{@Event}")]
+[CompilerServices.FailureImpl]
 public readonly partial record struct KeywordFailure(string @Event);
 
 public sealed record ExternalError(Polyester.Error.IError? Source) : Polyester.Error.IError
@@ -318,20 +396,20 @@ public readonly partial union TestFailure(NotFound, IncompleteData, HyperError);
 public readonly partial union HyperError(Disconnect);
 
 [CompilerServices.Failure("Can not find file {Filename} with size {LimitSize}")]
-public readonly partial record struct NotFound
+public readonly record struct NotFound
 {
     public readonly required string Filename { get; init; }
     public readonly required int LimitSize { get; init; }
 }
 
 [CompilerServices.Failure("Can not find file {Filename}")]
-public readonly partial record struct IncompleteData
+public readonly record struct IncompleteData
 {
     public readonly required string Filename { get; init; }
 }
 
 [CompilerServices.Failure("Can not find file {Filename}")]
-public readonly partial record struct Disconnect
+public readonly record struct Disconnect
 {
     public readonly required string Filename { get; init; }
 }
