@@ -5,5 +5,8 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <VersionPrefix>0.0.1-alpha.1.1</VersionPrefix>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/universehq/failure</RepositoryUrl>
   </PropertyGroup>
 </Project>
